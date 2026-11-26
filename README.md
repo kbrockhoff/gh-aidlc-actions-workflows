@@ -1,2 +1,4 @@
-# gh-aidlc-actions-workflows
-Provide GitHub Actions and shared workflows for AI-DLC
+# Brockhoff Cloud GitHub Actions and Shared Workflows for AI-DLC
+
+Provides GitHub Actions and shared workflows which support AI-DLC done the
+Brockhoff way.
