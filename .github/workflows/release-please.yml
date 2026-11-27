@@ -1,0 +1,58 @@
+# Opens and updates a release PR from conventional commits on main. Merging it
+# tags vX.Y.Z, publishes a GitHub release and moves the floating vMAJOR tag that
+# callers pin shared workflows to. RELEASE_PLEASE_TOKEN is used instead of
+# GITHUB_TOKEN so the release PR triggers CI and the tags are pushed by a real
+# identity.
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ steps.release.outputs.tag_name }}
+      major: ${{ steps.release.outputs.major }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  floating-tag:
+    name: Move floating major tag
+    needs: release-please
+    if: needs.release-please.outputs.release-created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Point v${{ needs.release-please.outputs.major }} at the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: v${{ needs.release-please.outputs.major }}
+          SHA: ${{ needs.release-please.outputs.sha }}
+          RELEASE: ${{ needs.release-please.outputs.tag-name }}
+        run: |
+          if gh api "repos/${REPO}/git/ref/tags/${TAG}" --silent 2>/dev/null; then
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/${TAG}" -f sha="${SHA}" -F force=true --silent
+          else
+            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${SHA}" --silent
+          fi
+          echo "Moved ${TAG} to ${RELEASE} (${SHA})" >> "${GITHUB_STEP_SUMMARY}"

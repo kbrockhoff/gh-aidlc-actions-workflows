@@ -70,7 +70,7 @@ jobs:
       force: ${{ inputs.force || false }}
 ```
 
-Pin `@main` to a release tag or commit SHA once releases exist.
+Pin `@main` to a release tag such as `@v0` or a commit SHA once releases exist.
 
 ### Inputs
 
