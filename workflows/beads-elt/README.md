@@ -77,7 +77,7 @@ Pin `@main` to a release tag or commit SHA once releases exist.
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
 | `aws-region` | yes | | Region of the S3 table bucket |
-| `aws-role-arn` | yes | | IAM role assumed through GitHub OIDC |
+| `aws-role-arn` | yes, unless the `aws-role-arn` secret is set | | IAM role assumed through GitHub OIDC |
 | `table-bucket-arn` | yes | | Target S3 Tables table bucket ARN |
 | `namespace` | no | `raw_beads` | Iceberg namespace for raw-zone tables |
 | `dolt-remote-url` | no | `git+<server>/<caller repo>.git` | Git remote holding `refs/dolt/data` |
@@ -86,8 +86,15 @@ Pin `@main` to a release tag or commit SHA once releases exist.
 | `force` | no | `false` | Load even if the ref or Dolt commit was already loaded |
 | `dolt-version` | no | `2.7.5` | Dolt CLI version to install |
 
-Secret `dolt-remote-token` is optional. Pass it when `GITHUB_TOKEN` can't read the Dolt
-remote, for example when `dolt-remote-url` points at another private repository.
+Both secrets are optional:
+
+- `aws-role-arn`: the role ARN, for callers that keep it in a repository secret. A caller
+  can't reference `secrets` in `with:`, so pass it under `secrets:` instead of the input.
+- `dolt-remote-token`: pass it when `GITHUB_TOKEN` can't read the Dolt remote, for example
+  when `dolt-remote-url` points at another private repository.
+
+[`beads-elt-raw.yml`](../../.github/workflows/beads-elt-raw.yml) is a working caller that
+loads this repository's own beads database with the role ARN from a secret.
 
 ### Outputs
 

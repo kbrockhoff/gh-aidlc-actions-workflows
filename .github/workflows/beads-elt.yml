@@ -11,9 +11,9 @@ on:
         type: string
         required: true
       aws-role-arn:
-        description: IAM role assumed through GitHub OIDC
+        description: IAM role assumed through GitHub OIDC (or pass the aws-role-arn secret)
         type: string
-        required: true
+        default: ""
       table-bucket-arn:
         description: Target S3 Tables table bucket ARN
         type: string
@@ -43,6 +43,9 @@ on:
         type: string
         default: "2.7.5"
     secrets:
+      aws-role-arn:
+        description: IAM role assumed through GitHub OIDC, for callers that keep the ARN in a secret
+        required: false
       dolt-remote-token:
         description: Token that can read the Dolt remote, if GITHUB_TOKEN cannot
         required: false
@@ -84,6 +87,17 @@ jobs:
     steps:
       # actions/checkout in a called workflow checks out the caller, so find this
       # workflow's own repository and commit from the job_workflow_* OIDC claims.
+      - name: Check inputs
+        shell: bash
+        env:
+          ROLE_INPUT: ${{ inputs.aws-role-arn }}
+          ROLE_SECRET: ${{ secrets.aws-role-arn }}
+        run: |
+          if [[ -z "${ROLE_INPUT}" && -z "${ROLE_SECRET}" ]]; then
+            echo "::error::Pass the aws-role-arn input or the aws-role-arn secret"
+            exit 1
+          fi
+
       - name: Locate workflow source
         id: source
         shell: bash
@@ -172,7 +186,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@45666896f5d8e0f10ae255413f3a4cdd03bdc8f5 # v6.3.1
         with:
-          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-to-assume: ${{ inputs.aws-role-arn || secrets.aws-role-arn }}
           aws-region: ${{ inputs.aws-region }}
           role-session-name: beads-elt-${{ github.run_id }}
 
