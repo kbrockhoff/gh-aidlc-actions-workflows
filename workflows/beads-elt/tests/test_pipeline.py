@@ -5,6 +5,7 @@ import json
 import pytest
 from conftest import requires_dolt
 
+from beads_elt import dolt
 from beads_elt.pipeline import LoadConfig, run
 
 pytestmark = requires_dolt
@@ -25,7 +26,7 @@ def _log(catalog):
 
 
 def test_first_load_creates_tables_with_lineage(catalog, dolt_remote):
-    result = run(catalog, _config(dolt_remote), ref_sha="sha-1")
+    result = run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
 
     assert not result.skipped
     assert result.row_counts == {"issues": 2, "labels": 1}
@@ -49,8 +50,8 @@ def test_first_load_creates_tables_with_lineage(catalog, dolt_remote):
 
 
 def test_same_ref_is_skipped(catalog, dolt_remote):
-    run(catalog, _config(dolt_remote), ref_sha="sha-1")
-    result = run(catalog, _config(dolt_remote, load_id="run-2"), ref_sha="sha-1")
+    run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
+    result = run(catalog, _config(dolt_remote, load_id="run-2"), resolve_ref=lambda: "sha-1")
 
     assert result.skipped
     assert "sha-1" in result.skip_reason
@@ -58,16 +59,18 @@ def test_same_ref_is_skipped(catalog, dolt_remote):
 
 
 def test_new_ref_with_same_dolt_commit_is_skipped(catalog, dolt_remote):
-    first = run(catalog, _config(dolt_remote), ref_sha="sha-1")
-    result = run(catalog, _config(dolt_remote, load_id="run-2"), ref_sha="sha-2")
+    first = run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
+    result = run(catalog, _config(dolt_remote, load_id="run-2"), resolve_ref=lambda: "sha-2")
 
     assert result.skipped
     assert first.dolt_commit in result.skip_reason
 
 
 def test_force_appends_another_snapshot(catalog, dolt_remote):
-    run(catalog, _config(dolt_remote), ref_sha="sha-1")
-    result = run(catalog, _config(dolt_remote, load_id="run-2", force=True), ref_sha="sha-1")
+    run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
+    result = run(
+        catalog, _config(dolt_remote, load_id="run-2", force=True), resolve_ref=lambda: "sha-1"
+    )
 
     assert not result.skipped
     assert len(catalog.load_table("raw_beads.issues").scan().to_arrow()) == 4
@@ -75,7 +78,7 @@ def test_force_appends_another_snapshot(catalog, dolt_remote):
 
 
 def test_schema_changes_are_evolved(catalog, dolt_remote):
-    run(catalog, _config(dolt_remote), ref_sha="sha-1")
+    run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
     dolt_remote.sql(
         "ALTER TABLE issues ADD COLUMN owner VARCHAR(255);"
         "ALTER TABLE issues DROP COLUMN ephemeral;"
@@ -84,7 +87,7 @@ def test_schema_changes_are_evolved(catalog, dolt_remote):
     )
     dolt_remote.commit_and_push("upgrade schema")
 
-    result = run(catalog, _config(dolt_remote, load_id="run-2"), ref_sha="sha-2")
+    result = run(catalog, _config(dolt_remote, load_id="run-2"), resolve_ref=lambda: "sha-2")
 
     assert result.row_counts == {"comments": 0, "issues": 2, "labels": 1}
     rows = catalog.load_table("raw_beads.issues").scan().to_arrow().to_pylist()
@@ -95,7 +98,7 @@ def test_schema_changes_are_evolved(catalog, dolt_remote):
 
 
 def test_table_prefix_applies_to_all_tables(catalog, dolt_remote):
-    run(catalog, _config(dolt_remote, table_prefix="widgets_"), ref_sha="sha-1")
+    run(catalog, _config(dolt_remote, table_prefix="widgets_"), resolve_ref=lambda: "sha-1")
 
     assert set(catalog.list_tables("raw_beads")) == {
         ("raw_beads", "widgets_issues"),
@@ -106,7 +109,7 @@ def test_table_prefix_applies_to_all_tables(catalog, dolt_remote):
 
 def test_invalid_namespace_fails_before_cloning(catalog, dolt_remote):
     with pytest.raises(ValueError, match="invalid S3 Tables name"):
-        run(catalog, _config(dolt_remote, namespace="_raw"), ref_sha="sha-1")
+        run(catalog, _config(dolt_remote, namespace="_raw"), resolve_ref=lambda: "sha-1")
 
 
 def test_existing_namespace_is_not_created_again(catalog, dolt_remote, monkeypatch):
@@ -116,6 +119,45 @@ def test_existing_namespace_is_not_created_again(catalog, dolt_remote, monkeypat
         raise AssertionError("create_namespace called for an existing namespace")
 
     monkeypatch.setattr(catalog, "create_namespace", fail)
-    result = run(catalog, _config(dolt_remote), ref_sha="sha-1")
+    result = run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
 
     assert not result.skipped
+
+
+def test_ref_moving_during_clone_records_the_cloned_ref(catalog, dolt_remote, monkeypatch):
+    refs = iter(["sha-1", "sha-2", "sha-2"])
+    clones = []
+    real_clone = dolt.clone
+    monkeypatch.setattr(
+        dolt, "clone", lambda url, dest: clones.append(dest) or real_clone(url, dest)
+    )
+
+    result = run(catalog, _config(dolt_remote), resolve_ref=lambda: next(refs))
+
+    assert result.ref_sha == "sha-2"
+    assert len(clones) == 2
+    rows = catalog.load_table("raw_beads.issues").scan().to_arrow().to_pylist()
+    assert {r["_dolt_ref_sha"] for r in rows} == {"sha-2"}
+    assert [e["dolt_ref_sha"] for e in _log(catalog)] == ["sha-2"]
+
+
+def test_ref_that_never_settles_fails(catalog, dolt_remote):
+    refs = (f"sha-{n}" for n in range(10))
+
+    with pytest.raises(dolt.DoltError, match="changed during each"):
+        run(catalog, _config(dolt_remote), resolve_ref=lambda: next(refs))
+
+
+def test_unpartitioned_table_is_repaired(catalog, dolt_remote):
+    # Simulates a run that created the table but failed before adding the partition spec.
+    run(catalog, _config(dolt_remote), resolve_ref=lambda: "sha-1")
+    issues = catalog.load_table("raw_beads.issues")
+    with issues.update_spec() as spec:
+        spec.remove_field("_source_repo")
+        spec.remove_field("_extracted_day")
+    assert catalog.load_table("raw_beads.issues").spec().is_unpartitioned()
+
+    run(catalog, _config(dolt_remote, load_id="run-2", force=True), resolve_ref=lambda: "sha-1")
+
+    fields = catalog.load_table("raw_beads.issues").spec().fields
+    assert {f.name for f in fields} == {"_source_repo", "_extracted_day"}

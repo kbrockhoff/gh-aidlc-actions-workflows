@@ -24,9 +24,12 @@ Parameters:
   AllowedSubjects:
     Type: CommaDelimitedList
     Description: >-
-      OIDC sub patterns allowed to assume the role, for example repo:my-org/my-repo:* or,
-      with a customized sub claim,
-      repo:my-org/my-repo:job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*
+      OIDC sub patterns allowed to assume the role. Repositories with immutable subjects
+      (default for repositories created after 2026-07-15) use repo:my-org@123456/my-repo@456789:*;
+      legacy ones use repo:my-org/my-repo:*. Get the prefix with
+      gh api repos/OWNER/REPO/actions/oidc/customization/sub --jq .sub_claim_prefix. With a
+      customized sub claim, append :job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*
+      instead of :*
   CreateOidcProvider:
     Type: String
     AllowedValues: ["true", "false"]

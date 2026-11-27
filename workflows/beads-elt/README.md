@@ -113,8 +113,22 @@ lists row counts per table.
 
 ### Trust policy
 
-Limit `sub` to the repositories that call the workflow. `repo:<owner>/<repo>:*` allows any
-branch or event in that repository.
+Limit `sub` to the repositories that call the workflow. The `repo` part of `sub` comes in
+two formats:
+
+- **Immutable**: `repo:<owner>@<owner-id>/<repo>@<repo-id>`. This is the default for
+  repositories created or renamed after 2026-07-15, including this one
+  (`repo:kbrockhoff@1822996/gh-aidlc-actions-workflows@1473676008`).
+- **Legacy**: `repo:<owner>/<repo>`, used by older repositories that haven't opted in.
+
+Look up a repository's prefix rather than guessing it:
+
+```bash
+gh api repos/my-org/my-repo/actions/oidc/customization/sub --jq .sub_claim_prefix
+```
+
+Appending `:*` to the prefix allows any branch or event in that repository. A role trusted by
+both kinds of repository can list one pattern of each format.
 
 ```json
 {
@@ -128,7 +142,7 @@ branch or event in that repository.
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-        "StringLike": { "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*" }
+        "StringLike": { "token.actions.githubusercontent.com:sub": "repo:my-org@123456/my-repo@456789:*" }
       }
     }
   ]
@@ -144,7 +158,9 @@ gh api -X PUT repos/my-org/my-repo/actions/oidc/customization/sub \
 ```
 
 Then match the new `sub` format, for example
-`repo:my-org/my-repo:job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*`.
+`repo:my-org@123456/my-repo@456789:job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*`.
+Repositories with immutable subjects keep the IDs in the `repo` part even when the claim is
+customized.
 This changes the `sub` of every OIDC token the repository issues, so update any other roles
 that trust it.
 
@@ -221,12 +237,16 @@ actions to `maintenance.s3tables.amazonaws.com`, or table creation fails. See
 ### Example infrastructure
 
 Both examples create the IAM role with the trust and permissions policies above, and can
-optionally create the GitHub OIDC provider, the table bucket (retained on delete) and the
-namespace. Their outputs map one-to-one to the workflow's `aws-role-arn`,
+optionally create the GitHub OIDC provider, the table bucket and the namespace. They treat
+deletion differently: the CloudFormation template sets `DeletionPolicy: Retain` on the
+bucket and namespace, so deleting the stack keeps the data. The Terraform example doesn't,
+so `terraform destroy` tries to delete a bucket and namespace it created. Set
+`create_table_bucket = false` to manage the bucket outside the example. Their outputs map one-to-one to the workflow's `aws-role-arn`,
 `table-bucket-arn`, `aws-region` and `namespace` inputs.
 
 - **Terraform**: [`examples/terraform`](examples/terraform). Copy
-  `terraform.tfvars.example` to `terraform.tfvars`, set `github_repositories`, then run
+  `terraform.tfvars.example` to `terraform.tfvars`, set `github_repositories` to each
+  repository's `sub` prefix without `repo:`, then run
   `terraform init && terraform apply`.
 - **CloudFormation**: [`examples/cloudformation/beads-elt-role.yaml`](examples/cloudformation/beads-elt-role.yaml).
   `AllowedSubjects` takes full `sub` patterns:
@@ -236,7 +256,7 @@ namespace. Their outputs map one-to-one to the workflow's `aws-role-arn`,
     --template-file examples/cloudformation/beads-elt-role.yaml \
     --stack-name beads-elt \
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-    --parameter-overrides 'AllowedSubjects=repo:my-org/my-repo:*'
+    --parameter-overrides 'AllowedSubjects=repo:my-org@123456/my-repo@456789:*'
   ```
 
 Set `create_oidc_provider` / `CreateOidcProvider` to false if the account already has the

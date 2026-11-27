@@ -133,15 +133,17 @@ def _load_or_create(catalog: Catalog, identifier: str, schema: pa.Schema) -> tup
 def write_snapshot(catalog: Catalog, identifier: str, data: pa.Table) -> None:
     """Append `data`, creating the table (partitioned by repo and day) or evolving its schema."""
     table, created = _load_or_create(catalog, identifier, data.schema)
-    if created:
-        with table.update_spec() as spec:
-            spec.add_identity("_source_repo")
-            spec.add_field("_extracted_at", DayTransform(), "_extracted_day")
-    else:
+    if not created:
         # Adds new columns; removed source columns stay in the table as nulls.
         # Incompatible type changes raise here and fail the run.
         with table.update_schema() as update:
             update.union_by_name(data.schema)
+    # S3 Tables doesn't support staged creates, so the spec is a second commit. Checking on
+    # every write also repairs a table left unpartitioned by a failure between the two.
+    if table.spec().is_unpartitioned():
+        with table.update_spec() as spec:
+            spec.add_identity("_source_repo")
+            spec.add_field("_extracted_at", DayTransform(), "_extracted_day")
     table.refresh()
     table.append(_align(data, table))
 

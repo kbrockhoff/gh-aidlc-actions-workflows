@@ -1,10 +1,16 @@
 variable "github_repositories" {
-  description = "Repositories (owner/name) allowed to assume the role through the beads-elt workflow"
+  description = <<-EOT
+    Repositories allowed to assume the role, written as they appear in the OIDC sub claim:
+    owner/name for legacy subjects, or owner@OWNER_ID/name@REPO_ID for repositories that use
+    immutable subjects (the default for repositories created after 2026-07-15). Get the value
+    with: gh api repos/OWNER/REPO/actions/oidc/customization/sub --jq .sub_claim_prefix
+    and drop the leading "repo:".
+  EOT
   type        = list(string)
 
   validation {
-    condition     = length(var.github_repositories) > 0 && alltrue([for r in var.github_repositories : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", r))])
-    error_message = "Give at least one repository, each as owner/name."
+    condition     = length(var.github_repositories) > 0 && alltrue([for r in var.github_repositories : can(regex("^[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$", r))])
+    error_message = "Give at least one repository, each as owner/name or owner@OWNER_ID/name@REPO_ID."
   }
 }
 

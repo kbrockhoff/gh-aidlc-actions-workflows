@@ -1,3 +1,4 @@
-github_repositories = ["my-org/my-repo"]
+# Use owner@OWNER_ID/name@REPO_ID for repositories with immutable OIDC subjects.
+github_repositories = ["my-org@123456/my-repo@456789"]
 table_bucket_name   = "aidlc-raw"
 namespace           = "raw_beads"

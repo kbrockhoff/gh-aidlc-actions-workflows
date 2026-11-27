@@ -79,8 +79,11 @@ def main(argv: list[str] | None = None) -> int:
         table_prefix=args.table_prefix,
         force=args.force,
     )
-    ref_sha = dolt.remote_ref_sha(args.remote_url)
-    result = run(s3tables_catalog(args.table_bucket_arn, args.region), config, ref_sha)
+    result = run(
+        s3tables_catalog(args.table_bucket_arn, args.region),
+        config,
+        lambda: dolt.remote_ref_sha(args.remote_url),
+    )
     _write_github_files(result)
     if result.skipped:
         print(f"Skipped: {result.skip_reason}")
