@@ -1,0 +1,85 @@
+name: Beads ELT CI
+
+on:
+  pull_request:
+    paths:
+      - workflows/beads-elt/**
+      - .github/workflows/beads-elt*.yml
+  push:
+    branches: [main]
+    paths:
+      - workflows/beads-elt/**
+      - .github/workflows/beads-elt*.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: workflows/beads-elt
+    env:
+      DOLT_VERSION: "2.7.5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Dolt
+        run: |
+          curl -sSfL -o "${RUNNER_TEMP}/dolt.tar.gz" \
+            "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/dolt.tar.gz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/dolt-linux-amd64/bin" >> "${GITHUB_PATH}"
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          working-directory: workflows/beads-elt
+          enable-cache: true
+
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -v
+
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: workflows/beads-elt/examples
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Validate Terraform example
+        working-directory: workflows/beads-elt/examples/terraform
+        run: |
+          terraform fmt -check -diff
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Lint CloudFormation example
+        run: uvx cfn-lint==1.61.0 cloudformation/beads-elt-role.yaml
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color .github/workflows/beads-elt*.yml

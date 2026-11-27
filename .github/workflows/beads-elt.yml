@@ -1,0 +1,219 @@
+# Reusable workflow: extract the full beads Dolt database from refs/dolt/data
+# and append it to S3 Tables Iceberg tables in the raw zone.
+# Spec: specs/beads-elt/intent.md. Code: workflows/beads-elt/.
+name: Beads ELT
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: Region of the S3 table bucket
+        type: string
+        required: true
+      aws-role-arn:
+        description: IAM role assumed through GitHub OIDC (or pass the aws-role-arn secret)
+        type: string
+        default: ""
+      table-bucket-arn:
+        description: Target S3 Tables table bucket ARN
+        type: string
+        required: true
+      namespace:
+        description: Iceberg namespace for raw-zone tables
+        type: string
+        default: raw_beads
+      dolt-remote-url:
+        description: Git remote holding refs/dolt/data (defaults to the calling repository)
+        type: string
+        default: ""
+      dolt-database:
+        description: Source database name (defaults to dolt_database in .beads/metadata.json)
+        type: string
+        default: ""
+      table-prefix:
+        description: Optional prefix for target table names
+        type: string
+        default: ""
+      force:
+        description: Load even if this ref or Dolt commit was already loaded
+        type: boolean
+        default: false
+      dolt-version:
+        description: Dolt CLI version to install
+        type: string
+        default: "2.7.5"
+    secrets:
+      aws-role-arn:
+        description: IAM role assumed through GitHub OIDC, for callers that keep the ARN in a secret
+        required: false
+      dolt-remote-token:
+        description: Token that can read the Dolt remote, if GITHUB_TOKEN cannot
+        required: false
+    outputs:
+      ref-sha:
+        description: SHA of refs/dolt/data that was checked
+        value: ${{ jobs.elt.outputs.ref-sha }}
+      dolt-commit:
+        description: Dolt commit that was loaded
+        value: ${{ jobs.elt.outputs.dolt-commit }}
+      tables-loaded:
+        description: Number of tables loaded
+        value: ${{ jobs.elt.outputs.tables-loaded }}
+      rows-loaded:
+        description: Number of rows loaded across all tables
+        value: ${{ jobs.elt.outputs.rows-loaded }}
+      skipped:
+        description: "true when the ref or Dolt commit was already loaded"
+        value: ${{ jobs.elt.outputs.skipped }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  elt:
+    name: Extract and load beads
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: beads-elt-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      ref-sha: ${{ steps.load.outputs.ref-sha }}
+      dolt-commit: ${{ steps.load.outputs.dolt-commit }}
+      tables-loaded: ${{ steps.load.outputs.tables-loaded }}
+      rows-loaded: ${{ steps.load.outputs.rows-loaded }}
+      skipped: ${{ steps.load.outputs.skipped }}
+    steps:
+      # actions/checkout in a called workflow checks out the caller, so find this
+      # workflow's own repository and commit from the job_workflow_* OIDC claims.
+      - name: Check inputs
+        shell: bash
+        env:
+          ROLE_INPUT: ${{ inputs.aws-role-arn }}
+          ROLE_SECRET: ${{ secrets.aws-role-arn }}
+        run: |
+          if [[ -z "${ROLE_INPUT}" && -z "${ROLE_SECRET}" ]]; then
+            echo "::error::Pass the aws-role-arn input or the aws-role-arn secret"
+            exit 1
+          fi
+
+      - name: Locate workflow source
+        id: source
+        shell: bash
+        run: |
+          token=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=beads-elt" | jq -r .value)
+          echo "::add-mask::${token}"
+          python3 - "${token}" >> "${GITHUB_OUTPUT}" <<'EOF'
+          import base64, json, sys
+          payload = sys.argv[1].split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          owner, name = claims["job_workflow_ref"].split("/")[:2]
+          print(f"repository={owner}/{name}")
+          print(f"sha={claims['job_workflow_sha']}")
+          EOF
+
+      - name: Check out beads-elt source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.sha }}
+          path: .beads-elt
+          sparse-checkout: workflows/beads-elt
+          persist-credentials: false
+
+      - name: Read beads metadata
+        if: inputs.dolt-database == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .caller
+          sparse-checkout: .beads/metadata.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve settings
+        id: settings
+        shell: bash
+        env:
+          INPUT_REMOTE: ${{ inputs.dolt-remote-url }}
+          INPUT_DATABASE: ${{ inputs.dolt-database }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          remote="${INPUT_REMOTE:-git+${SERVER_URL}/${REPOSITORY}.git}"
+          database="${INPUT_DATABASE}"
+          if [[ -z "${database}" && -f .caller/.beads/metadata.json ]]; then
+            database=$(jq -r '.dolt_database // empty' .caller/.beads/metadata.json)
+          fi
+          database="${database:-${REPOSITORY#*/}}"
+          {
+            echo "remote=${remote}"
+            echo "database=${database}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install Dolt
+        shell: bash
+        env:
+          DOLT_VERSION: ${{ inputs.dolt-version }}
+        run: |
+          curl -sSfL -o "${RUNNER_TEMP}/dolt.tar.gz" \
+            "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/dolt.tar.gz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/dolt-linux-amd64/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/dolt-linux-amd64/bin/dolt" config --global --add user.name "beads-elt"
+          "${RUNNER_TEMP}/dolt-linux-amd64/bin/dolt" config --global \
+            --add user.email "beads-elt@users.noreply.github.com"
+          "${RUNNER_TEMP}/dolt-linux-amd64/bin/dolt" version
+
+      # Dolt's git remotes shell out to git, so authenticate git for HTTPS fetches.
+      - name: Configure git auth for Dolt remote
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.dolt-remote-token || github.token }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          header=$(printf 'x-access-token:%s' "${TOKEN}" | base64 -w0)
+          echo "::add-mask::${header}"
+          git config --global "http.${SERVER_URL}/.extraheader" "AUTHORIZATION: basic ${header}"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          working-directory: .beads-elt/workflows/beads-elt
+          enable-cache: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@45666896f5d8e0f10ae255413f3a4cdd03bdc8f5 # v6.3.1
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn || secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: beads-elt-${{ github.run_id }}
+
+      - name: Extract and load
+        id: load
+        shell: bash
+        working-directory: .beads-elt/workflows/beads-elt
+        env:
+          REMOTE: ${{ steps.settings.outputs.remote }}
+          DATABASE: ${{ steps.settings.outputs.database }}
+          SOURCE_REPO: ${{ github.repository }}
+          LOAD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          TABLE_BUCKET_ARN: ${{ inputs.table-bucket-arn }}
+          REGION: ${{ inputs.aws-region }}
+          NAMESPACE: ${{ inputs.namespace }}
+          TABLE_PREFIX: ${{ inputs.table-prefix }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=(
+            --remote-url "${REMOTE}"
+            --source-repo "${SOURCE_REPO}"
+            --dolt-database "${DATABASE}"
+            --load-id "${LOAD_ID}"
+            --table-bucket-arn "${TABLE_BUCKET_ARN}"
+            --region "${REGION}"
+            --namespace "${NAMESPACE}"
+            --table-prefix "${TABLE_PREFIX}"
+          )
+          if [[ "${FORCE}" == "true" ]]; then args+=(--force); fi
+          uv run --frozen --no-dev beads-elt "${args[@]}"
