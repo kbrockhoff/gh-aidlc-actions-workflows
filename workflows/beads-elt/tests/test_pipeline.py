@@ -107,3 +107,15 @@ def test_table_prefix_applies_to_all_tables(catalog, dolt_remote):
 def test_invalid_namespace_fails_before_cloning(catalog, dolt_remote):
     with pytest.raises(ValueError, match="invalid S3 Tables name"):
         run(catalog, _config(dolt_remote, namespace="_raw"), ref_sha="sha-1")
+
+
+def test_existing_namespace_is_not_created_again(catalog, dolt_remote, monkeypatch):
+    catalog.create_namespace("raw_beads")
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("create_namespace called for an existing namespace")
+
+    monkeypatch.setattr(catalog, "create_namespace", fail)
+    result = run(catalog, _config(dolt_remote), ref_sha="sha-1")
+
+    assert not result.skipped

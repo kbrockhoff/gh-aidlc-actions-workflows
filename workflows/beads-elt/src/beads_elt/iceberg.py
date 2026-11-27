@@ -115,8 +115,12 @@ def with_lineage(table: pa.Table, lineage: Lineage) -> pa.Table:
 
 
 def ensure_namespace(catalog: Catalog, namespace: str) -> None:
+    # Check first so a pre-provisioned namespace needs only s3tables:GetNamespace,
+    # which can be scoped to the namespace; s3tables:CreateNamespace cannot.
+    if catalog.namespace_exists(validate_name(namespace)):
+        return
     with contextlib.suppress(NamespaceAlreadyExistsError):
-        catalog.create_namespace(validate_name(namespace))
+        catalog.create_namespace(namespace)
 
 
 def _load_or_create(catalog: Catalog, identifier: str, schema: pa.Schema) -> tuple[Table, bool]:

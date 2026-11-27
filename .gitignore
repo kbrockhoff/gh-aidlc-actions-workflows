@@ -228,3 +228,14 @@ __marimo__/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+# Examples are applied by users, who should create their own lock files
+workflows/*/examples/**/.terraform.lock.hcl

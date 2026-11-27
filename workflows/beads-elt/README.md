@@ -98,9 +98,16 @@ lists row counts per table.
 
 - An S3 Tables table bucket. To query it from Athena, turn on the bucket's integration with
   AWS analytics services (Glue Data Catalog and Lake Formation).
-- A GitHub OIDC identity provider (`token.actions.githubusercontent.com`) in the account.
-- An IAM role whose trust policy limits `sub` to the calling repositories, for example
-  `repo:my-org/my-repo:*`, and that allows the S3 Tables operations the loader uses:
+- Optionally, the raw-zone namespace created ahead of time (for example by IaC). The role
+  then needs no `s3tables:CreateNamespace`, which can't be scoped to a namespace.
+- The GitHub OIDC identity provider `token.actions.githubusercontent.com` in the account,
+  with audience `sts.amazonaws.com`.
+- An IAM role with the trust and permissions policies below.
+
+### Trust policy
+
+Limit `sub` to the repositories that call the workflow. `repo:<owner>/<repo>:*` allows any
+branch or event in that repository.
 
 ```json
 {
@@ -108,27 +115,125 @@ lists row counts per table.
   "Statement": [
     {
       "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+        "StringLike": { "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*" }
+      }
+    }
+  ]
+}
+```
+
+To also require that the token comes from this reusable workflow, customize the calling
+repository's OIDC subject to include `job_workflow_ref`:
+
+```bash
+gh api -X PUT repos/my-org/my-repo/actions/oidc/customization/sub \
+  -F use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=job_workflow_ref'
+```
+
+Then match the new `sub` format, for example
+`repo:my-org/my-repo:job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*`.
+This changes the `sub` of every OIDC token the repository issues, so update any other roles
+that trust it.
+
+### Permissions policy
+
+Each action below is one the loader triggers through the
+[S3 Tables Iceberg REST endpoint](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-open-source.html).
+Replace the region, account, bucket name and namespace.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCatalogConfig",
+      "Effect": "Allow",
+      "Action": "s3tables:GetTableBucket",
+      "Resource": "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw"
+    },
+    {
+      "Sid": "UseRawNamespace",
+      "Effect": "Allow",
+      "Action": ["s3tables:GetNamespace", "s3tables:CreateTable"],
+      "Resource": "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw",
+      "Condition": { "StringEquals": { "s3tables:namespace": "raw_beads" } }
+    },
+    {
+      "Sid": "ReadWriteRawTables",
+      "Effect": "Allow",
       "Action": [
-        "s3tables:GetTableBucket",
-        "s3tables:ListNamespaces",
-        "s3tables:GetNamespace",
-        "s3tables:CreateNamespace",
-        "s3tables:ListTables",
-        "s3tables:GetTable",
-        "s3tables:CreateTable",
         "s3tables:GetTableMetadataLocation",
         "s3tables:UpdateTableMetadataLocation",
         "s3tables:GetTableData",
         "s3tables:PutTableData"
       ],
-      "Resource": [
-        "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw",
-        "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw/table/*"
-      ]
+      "Resource": "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw/table/*",
+      "Condition": { "StringEquals": { "s3tables:namespace": "raw_beads" } }
     }
   ]
 }
 ```
+
+| Action | Why the loader needs it |
+| --- | --- |
+| `s3tables:GetTableBucket` | `GET /v1/config` when the catalog connects |
+| `s3tables:GetNamespace` | `HEAD` namespace: checks that the namespace exists |
+| `s3tables:CreateTable` | Creates each table, and the load log, on first load |
+| `s3tables:GetTableMetadataLocation` | Loads a table before appending or scanning the load log |
+| `s3tables:UpdateTableMetadataLocation` | Commits appends, schema changes and the partition spec |
+| `s3tables:GetTableData` | Reads metadata and manifest files and scans the load log |
+| `s3tables:PutTableData` | Writes Parquet data, manifest and metadata files |
+
+These are left out on purpose: `ListNamespaces`, `ListTables` and `GetTable` (the loader
+never lists or checks for tables), and every delete, rename, policy and maintenance action.
+The loader doesn't use vended credentials, so no plain `s3:` actions are needed.
+
+If the namespace isn't created ahead of time, add this statement. `CreateNamespace` has no
+`s3tables:namespace` condition key, so it can't be limited to one namespace.
+
+```json
+{
+  "Sid": "CreateRawNamespace",
+  "Effect": "Allow",
+  "Action": "s3tables:CreateNamespace",
+  "Resource": "arn:aws:s3tables:us-east-1:123456789012:bucket/aidlc-raw"
+}
+```
+
+If the bucket or its tables use SSE-KMS with a customer managed key, the role also needs
+`kms:GenerateDataKey` and `kms:Decrypt` on that key. The key policy must grant the same two
+actions to `maintenance.s3tables.amazonaws.com`, or table creation fails. See
+[permission requirements for S3 Tables SSE-KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-kms-permissions.html).
+
+### Example infrastructure
+
+Both examples create the IAM role with the trust and permissions policies above, and can
+optionally create the GitHub OIDC provider, the table bucket (retained on delete) and the
+namespace. Their outputs map one-to-one to the workflow's `aws-role-arn`,
+`table-bucket-arn`, `aws-region` and `namespace` inputs.
+
+- **Terraform**: [`examples/terraform`](examples/terraform). Copy
+  `terraform.tfvars.example` to `terraform.tfvars`, set `github_repositories`, then run
+  `terraform init && terraform apply`.
+- **CloudFormation**: [`examples/cloudformation/beads-elt-role.yaml`](examples/cloudformation/beads-elt-role.yaml).
+  `AllowedSubjects` takes full `sub` patterns:
+
+  ```bash
+  aws cloudformation deploy \
+    --template-file examples/cloudformation/beads-elt-role.yaml \
+    --stack-name beads-elt \
+    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+    --parameter-overrides 'AllowedSubjects=repo:my-org/my-repo:*'
+  ```
+
+Set `create_oidc_provider` / `CreateOidcProvider` to false if the account already has the
+GitHub provider, since an account can have only one per URL.
 
 ## Development
 
@@ -142,4 +247,6 @@ uv sync
 uv run pytest
 uv run ruff check . && uv run ruff format --check .
 actionlint ../../.github/workflows/beads-elt*.yml
+(cd examples/terraform && terraform fmt -check && terraform init -backend=false && terraform validate)
+uvx cfn-lint examples/cloudformation/beads-elt-role.yaml
 ```

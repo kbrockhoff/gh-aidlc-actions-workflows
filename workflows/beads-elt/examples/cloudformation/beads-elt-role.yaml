@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  IAM role for the beads-elt GitHub Actions workflow, assumed through GitHub OIDC, with
+  least-privilege S3 Tables access to one raw-zone namespace. Optionally creates the OIDC
+  provider, table bucket and namespace.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: GH Actions -OIDC-> IAM role -> S3 Tables Iceberg REST (s3tables.<region>.amazonaws.com/iceberg)
+    ref: workflows/beads-elt/README.md#aws-prerequisites
+    must:
+      - policy == README permissions policy; change both together
+      - every table/namespace action scoped by s3tables:namespace cond
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: GitHub }
+        Parameters: [AllowedSubjects, CreateOidcProvider, RoleName]
+      - Label: { default: S3 Tables }
+        Parameters: [TableBucketName, CreateTableBucket, Namespace, CreateNamespace, KmsKeyArn]
+
+Parameters:
+  AllowedSubjects:
+    Type: CommaDelimitedList
+    Description: >-
+      OIDC sub patterns allowed to assume the role, for example repo:my-org/my-repo:* or,
+      with a customized sub claim,
+      repo:my-org/my-repo:job_workflow_ref:kbrockhoff/gh-aidlc-actions-workflows/.github/workflows/beads-elt.yml@*
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Create the GitHub OIDC provider. Use false if the account already has one.
+  RoleName:
+    Type: String
+    Default: ""
+    Description: Optional IAM role name. Leave empty to let CloudFormation generate one.
+  TableBucketName:
+    Type: String
+    Default: aidlc-raw
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+    Description: Name of the S3 Tables table bucket for the raw zone
+  CreateTableBucket:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Create the table bucket. Use false to use an existing bucket named TableBucketName.
+  Namespace:
+    Type: String
+    Default: raw_beads
+    AllowedPattern: "^[a-z0-9]([a-z0-9_]{0,253}[a-z0-9])?$"
+    Description: Raw-zone namespace the workflow writes to
+  CreateNamespace:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      Create the namespace here. With false, the role gets s3tables:CreateNamespace on the
+      bucket instead, which can't be limited to one namespace.
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional customer managed KMS key for SSE-KMS. Its key policy must also allow
+      maintenance.s3tables.amazonaws.com to use it.
+
+Conditions:
+  CreateOidcProviderCond: !Equals [!Ref CreateOidcProvider, "true"]
+  CreateTableBucketCond: !Equals [!Ref CreateTableBucket, "true"]
+  CreateNamespaceCond: !Equals [!Ref CreateNamespace, "true"]
+  WorkflowCreatesNamespace: !Not [!Condition CreateNamespaceCond]
+  UseKms: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasRoleName: !Not [!Equals [!Ref RoleName, ""]]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProviderCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: one per account; shared by every GH Actions role
+        must:
+          - ClientIdList incl sts.amazonaws.com (configure-aws-credentials default aud)
+        mutable: review-required
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  RawTableBucket:
+    Type: AWS::S3Tables::TableBucket
+    Condition: CreateTableBucketCond
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: raw-zone Iceberg history; Retain so stack delete never drops data
+        must:
+          - name change -> replacement; Retain orphans old bucket
+        mutable: change-with-constraints
+    Properties:
+      TableBucketName: !Ref TableBucketName
+      EncryptionConfiguration: !If
+        - UseKms
+        - SSEAlgorithm: aws:kms
+          KMSKeyArn: !Ref KmsKeyArn
+        - SSEAlgorithm: AES256
+
+  RawNamespace:
+    Type: AWS::S3Tables::Namespace
+    Condition: CreateNamespaceCond
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: pre-create so role needs no unscopable s3tables:CreateNamespace
+        must:
+          - Namespace == role policy s3tables:namespace cond
+        mutable: must-never-change
+    Properties:
+      TableBucketARN: !If
+        - CreateTableBucketCond
+        - !GetAtt RawTableBucket.TableBucketARN
+        - !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+      Namespace: !Ref Namespace
+
+  BeadsEltRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: assumed by beads-elt reusable workflow via configure-aws-credentials
+        must:
+          - trust: aud == sts.amazonaws.com & sub limited to AllowedSubjects
+          - no s3:* or s3tables:* wildcards; loader uses no vended creds
+        mutable: review-required
+    Properties:
+      RoleName: !If [HasRoleName, !Ref RoleName, !Ref AWS::NoValue]
+      Description: Assumed by the beads-elt GitHub Actions workflow to load the raw zone
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateOidcProviderCond
+                - !GetAtt GitHubOidcProvider.Arn
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Ref AllowedSubjects
+      Policies:
+        - PolicyName: beads-elt-s3tables
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadCatalogConfig
+                Effect: Allow
+                Action: s3tables:GetTableBucket
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+              - Sid: UseRawNamespace
+                Effect: Allow
+                Action:
+                  - s3tables:GetNamespace
+                  - s3tables:CreateTable
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+                Condition:
+                  StringEquals:
+                    s3tables:namespace: !Ref Namespace
+              - Sid: ReadWriteRawTables
+                Effect: Allow
+                Action:
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:GetTableData
+                  - s3tables:PutTableData
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}/table/*
+                Condition:
+                  StringEquals:
+                    s3tables:namespace: !Ref Namespace
+              - !If
+                - WorkflowCreatesNamespace
+                - Sid: CreateRawNamespace
+                  Effect: Allow
+                  Action: s3tables:CreateNamespace
+                  Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+                - !Ref AWS::NoValue
+              - !If
+                - UseKms
+                - Sid: UseTableKey
+                  Effect: Allow
+                  Action:
+                    - kms:GenerateDataKey
+                    - kms:Decrypt
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
+
+Outputs:
+  AwsRoleArn:
+    Description: Pass as the aws-role-arn input of the beads-elt workflow
+    Value: !GetAtt BeadsEltRole.Arn
+  TableBucketArn:
+    Description: Pass as the table-bucket-arn input of the beads-elt workflow
+    Value: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+  AwsRegion:
+    Description: Pass as the aws-region input of the beads-elt workflow
+    Value: !Ref AWS::Region
+  Namespace:
+    Description: Pass as the namespace input of the beads-elt workflow
+    Value: !Ref Namespace

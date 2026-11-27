@@ -1,0 +1,3 @@
+github_repositories = ["my-org/my-repo"]
+table_bucket_name   = "aidlc-raw"
+namespace           = "raw_beads"
