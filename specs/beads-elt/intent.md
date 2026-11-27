@@ -75,7 +75,7 @@ Spike findings (ghaw-117.1, 2026-11-27, verified with a real `bd dolt push`):
 | Option | How | Verdict |
 | --- | --- | --- |
 | A. `on: push` | Caller workflow filters on `refs/dolt/data` or `__dolt_remote_info__` | Not possible: pushed commits never contain the workflow file |
-| B. Schedule + change detection | Caller runs on `schedule`; job reads the `refs/dolt/data` SHA with `git ls-remote` and exits early if it matches the last SHA in `_load_log` | Works with no extra infrastructure; latency equals the poll interval |
+| B. Schedule + change detection | Caller runs on `schedule`; job reads the `refs/dolt/data` SHA with `git ls-remote` and exits early if it matches a loaded SHA in `beads_elt_load_log` | Works with no extra infrastructure; latency equals the poll interval |
 | C. Client-side dispatch | A wrapper around `bd` sends `repository_dispatch` after pushing | Rejected: no bd post-push hook, and auto-push bypasses wrappers |
 | D. Webhook relay | Repository or org webhook on `push`, filtered to `refs/heads/__dolt_remote_info__`, calls a small relay (for example a Lambda function URL) that sends `repository_dispatch` | Near real time; needs a relay, a webhook secret and a GitHub App or token |
 
@@ -135,19 +135,29 @@ Outputs: `dolt-commit`, `ref-sha`, `tables-loaded`, `rows-loaded`, `skipped`.
 5. Schema evolution: new source columns are added to the Iceberg table;
    removed columns are retained as nullable. Type changes that cannot be
    widened fail the run with a clear error.
-6. Record each successful load in a control table
-   (`<namespace>._load_log`) with repo, ref SHA, Dolt commit, per-table row
-   counts, status, and timestamps. This table drives the change detection in
-   Extract step 2.
-7. Load all tables for a run before marking it successful in `_load_log`, so
-   a partial failure is retried in full on the next trigger.
+6. Record each load in a control table
+   (`<namespace>.<table-prefix>beads_elt_load_log`) with repo, ref SHA, Dolt
+   commit, per-table row counts, status (`succeeded` or `failed`), error, and
+   timestamps. This table drives the change detection in Extract step 2. S3
+   Tables names must start with a letter or digit, so the table can't be
+   named `_load_log`.
+7. Load all tables for a run before marking it succeeded in the load log, so
+   a partial failure is retried in full on the next trigger. Rows from a
+   partial load stay in the raw tables; readers pick snapshots by joining on
+   a succeeded `load_id`.
+8. Skip also when the cloned Dolt HEAD commit was already loaded, so a ref
+   that moved without new Dolt data doesn't add a duplicate snapshot.
 
 ### Implementation Notes
 
-- Prefer a Python step using PyIceberg with the S3 Tables Iceberg REST
-  catalog endpoint (SigV4 auth) and PyArrow, which avoids needing Spark or
-  EMR. Alternatives (Athena `INSERT`, Glue job, Firehose) are acceptable if
-  the spike shows PyIceberg is unsuitable.
+- Implemented in Python under `workflows/beads-elt/` with PyIceberg (S3
+  Tables Iceberg REST endpoint, SigV4) and PyArrow, so no Spark or EMR.
+  `dolt table export` writes Parquet directly; unsigned, nanosecond, and
+  large Arrow types are mapped to Iceberg-supported types before writing.
+- A called workflow's `actions/checkout` checks out the caller, so the
+  reusable workflow finds its own repository and commit from the
+  `job_workflow_ref` and `job_workflow_sha` OIDC claims and checks out
+  `workflows/beads-elt` at that commit.
 - Concurrency: use a workflow `concurrency` group per source repository so
   only one load runs at a time; Iceberg optimistic commits handle any
   remaining races.
