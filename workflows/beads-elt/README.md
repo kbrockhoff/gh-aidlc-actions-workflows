@@ -130,6 +130,11 @@ gh api repos/my-org/my-repo/actions/oidc/customization/sub --jq .sub_claim_prefi
 Appending `:*` to the prefix allows any branch or event in that repository. A role trusted by
 both kinds of repository can list one pattern of each format.
 
+An owner-wide wildcard such as `repo:my-org@123456/*@*:*` matches only immutable subjects, so
+older repositories under the same owner (`repo:my-org/my-repo:ref:refs/heads/main`) can't
+assume the role. To trust every repository of an owner, list both
+`repo:my-org@123456/*@*:*` and `repo:my-org/*:*`.
+
 ```json
 {
   "Version": "2012-10-17",
