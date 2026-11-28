@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/kbrockhoff/gh-aidlc-actions-workflows/compare/v0.1.0...v0.1.1) (2026-11-28)
+
+
+### Documentation
+
+* **beads-elt:** warn that owner-wide OIDC wildcards need both sub formats ([#4](https://github.com/kbrockhoff/gh-aidlc-actions-workflows/issues/4)) ([fb91e4b](https://github.com/kbrockhoff/gh-aidlc-actions-workflows/commit/fb91e4b23028135b57512643fb5299207428b5d0))
+
 ## 0.1.0 (2026-11-27)
 
 
